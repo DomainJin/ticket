@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Check In — Đăng Ký Vé</title>
-    <link rel="icon" type="image/png" href="./icon.png" />
+    <link rel="icon" type="image/png" href="icon.png" />
     <link
       href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,300&display=swap"
       rel="stylesheet"
@@ -1097,7 +1097,7 @@
             <input
               type="file"
               id="photo-input"
-              accept="image/jpeg,image/png,image/webp"
+              accept="image/jpeg,image/png,image/webp,image/heic,image/heif"
               onchange="handlePhotoSelected(event)"
             />
 
@@ -1351,10 +1351,10 @@
         var phone = document.getElementById("f-phone").value.trim();
         var email = document.getElementById("f-email").value.trim();
 
-        // Step 1: register form data
         setPhotoStatus("Đang đăng ký vé…", false);
         showProgress(30);
 
+        // Step 1: Đăng ký thông tin — dùng form-urlencoded (simple request, no preflight)
         fetch(GAS_URL, {
           method: "POST",
           headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -1364,46 +1364,67 @@
             return r.json();
           })
           .then(function (data) {
-            if (!data.success) {
+            if (!data.success)
               throw new Error(data.error || "Lỗi không xác định");
-            }
 
             var qrCode = data.qrText || data.qr_text;
             if (!qrCode) throw new Error("Mã vé không được trả về");
 
             showProgress(60);
 
-            // Step 2: if photo selected, upload it
-            if (_photoBase64) {
-              setPhotoStatus("Đang tải ảnh lên…", false);
-
-              var ext = (_photoMime || "image/jpeg").split("/")[1] || "jpg";
-              var fileName = qrCode + "." + ext;
-
-              var imgPayload = JSON.stringify({
-                action: "insertImage",
-                fileName: fileName,
-                base64: _photoBase64,
-                mimeType: _photoMime,
-              });
-
-              return sendToGAS(imgPayload)
-                .then(function () {
-                  showProgress(100);
-                  return qrCode;
-                })
-                .catch(function () {
-                  // ảnh lỗi nhưng đăng ký vẫn thành công
-                  showProgress(100);
-                  return qrCode;
-                });
-            } else {
+            // Step 2: Upload ảnh nếu có
+            if (!_photoBase64) {
               showProgress(100);
-              return qrCode;
+              return Promise.resolve(qrCode);
             }
+
+            setPhotoStatus("Đang tải ảnh lên…", false);
+            var ext = (_photoMime || "image/jpeg").split("/")[1] || "jpg";
+            var fileName = qrCode + "." + ext;
+
+            var imgPayload = JSON.stringify({
+              action: "insertImage",
+              fileName: fileName,
+              base64: _photoBase64,
+              mimeType: _photoMime,
+            });
+
+            // Dùng biến ngoài để catch có thể access qrCode
+            return sendToGAS(imgPayload)
+              .then(function (imgResult) {
+                showProgress(100);
+                if (imgResult && imgResult.success) {
+                  setPhotoStatus("✅ Ảnh đã lưu!", "ok");
+                } else if (imgResult && imgResult.noCors) {
+                  setPhotoStatus("✅ Ảnh đã gửi", "ok");
+                } else {
+                  var reason = (imgResult && imgResult.error) || "không rõ";
+                  setPhotoStatus("⚠ Ảnh chưa lưu được: " + reason, false);
+                }
+                return qrCode;
+              })
+              .catch(function (imgErr) {
+                // Ảnh lỗi nhưng KHÔNG chặn success — vé đã đăng ký thành công
+                showProgress(100);
+                setPhotoStatus(
+                  "⚠ Ảnh chưa lưu (" + (imgErr.message || "lỗi") + ")",
+                  false,
+                );
+                return qrCode; // ← fix: qrCode vẫn accessible ở đây vì Promise chain
+              });
           })
           .then(function (qrCode) {
-            // Success!
+            // Đợi 800ms để user thấy status ảnh trước khi đóng modal
+            return new Promise(function (resolve) {
+              setTimeout(
+                function () {
+                  resolve(qrCode);
+                },
+                _photoBase64 ? 800 : 0,
+              );
+            });
+          })
+          .then(function (qrCode) {
             closeModal();
             document.getElementById("ticket-code").textContent = qrCode;
             document.getElementById("form-wrap").classList.add("hide");
@@ -1424,57 +1445,38 @@
         location.hostname === "localhost";
 
       function sendToGAS(payload) {
-        // Thử POST JSON bình thường (desktop / HTTPS host)
+        // GAS Web App: dùng Content-Type: text/plain (simple request)
+        // → không trigger CORS preflight → hoạt động trên cả mobile và desktop
+        // GAS vẫn đọc được body qua e.postData.contents
+
         return fetch(GAS_URL, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "text/plain" },
           body: payload,
+          redirect: "follow",
         })
           .then(function (r) {
-            if (!r.ok) throw new Error("HTTP " + r.status);
-            return r.json();
+            if (r.ok && r.type !== "opaque") {
+              return r.json().catch(function () {
+                return { success: true, noCors: false };
+              });
+            }
+            return { success: true, noCors: true };
           })
           .catch(function (err) {
-            // CORS bị block (mobile hoặc local) → fallback GET với URL params
-            var isCorsErr =
-              err.message &&
-              (err.message.indexOf("CORS") !== -1 ||
-                err.message.indexOf("fetch") !== -1 ||
-                err.message.indexOf("Failed") !== -1 ||
-                err.message.indexOf("NetworkError") !== -1);
-            if (isCorsErr || _isLocal) {
-              try {
-                var data = JSON.parse(payload);
-                // base64 có thể rất lớn → encode an toàn
-                var params = new URLSearchParams({
-                  action: data.action || "",
-                  fileName: data.fileName || "",
-                  base64: data.base64 || "",
-                  mimeType: data.mimeType || "",
-                });
-                // GET request — không có preflight, mobile OK
-                return fetch(GAS_URL + "?" + params.toString(), {
-                  method: "GET",
-                })
-                  .then(function (r2) {
-                    return r2.json();
-                  })
-                  .catch(function () {
-                    // Nếu GET cũng fail (base64 quá dài) → no-cors POST cuối cùng
-                    return fetch(GAS_URL, {
-                      method: "POST",
-                      mode: "no-cors",
-                      headers: { "Content-Type": "text/plain" },
-                      body: payload,
-                    }).then(function () {
-                      return { success: true, noCors: true };
-                    });
-                  });
-              } catch (e2) {
-                return { success: false, error: e2.message };
-              }
-            }
-            throw err;
+            setPhotoStatus("Thử phương án dự phòng…", false);
+            return fetch(GAS_URL, {
+              method: "POST",
+              mode: "no-cors",
+              headers: { "Content-Type": "text/plain" },
+              body: payload,
+            })
+              .then(function () {
+                return { success: true, noCors: true };
+              })
+              .catch(function (e2) {
+                return { success: false, error: err.message };
+              });
           });
       }
       function showProgress(pct) {
