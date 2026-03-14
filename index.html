@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Check In — Đăng Ký Vé</title>
-    <link rel="icon" type="image/png" href="icon.png" />
+    <link rel="icon" type="image/png" href="./icon.png" />
     <link
       href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,300&display=swap"
       rel="stylesheet"
@@ -1240,6 +1240,38 @@
         document.getElementById("photo-input").click();
       }
 
+      // Resize ảnh xuống tối đa 800px và compress JPEG 0.75
+      // → base64 ~50–80KB, đủ nhỏ để gửi qua cả GET URL và POST mobile
+      function resizeAndCompress(file, callback) {
+        var MAX_SIZE = 800;
+        var QUALITY = 0.75;
+        var reader = new FileReader();
+        reader.onload = function (ev) {
+          var img = new Image();
+          img.onload = function () {
+            var w = img.width,
+              h = img.height;
+            if (w > MAX_SIZE || h > MAX_SIZE) {
+              if (w > h) {
+                h = Math.round((h * MAX_SIZE) / w);
+                w = MAX_SIZE;
+              } else {
+                w = Math.round((w * MAX_SIZE) / h);
+                h = MAX_SIZE;
+              }
+            }
+            var canvas = document.createElement("canvas");
+            canvas.width = w;
+            canvas.height = h;
+            canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+            var compressed = canvas.toDataURL("image/jpeg", QUALITY);
+            callback(compressed);
+          };
+          img.src = ev.target.result;
+        };
+        reader.readAsDataURL(file);
+      }
+
       function handlePhotoSelected(e) {
         var file = e.target.files[0];
         if (!file) return;
@@ -1253,11 +1285,11 @@
         }
 
         _photoFile = file;
-        _photoMime = file.type || "image/jpeg";
+        _photoMime = "image/jpeg"; // luôn output JPEG sau resize
 
-        var reader = new FileReader();
-        reader.onload = function (ev) {
-          var dataURL = ev.target.result;
+        setPhotoStatus("Đang xử lý ảnh…", false);
+
+        resizeAndCompress(file, function (dataURL) {
           _photoBase64 = dataURL.substring(dataURL.indexOf(",") + 1);
 
           // Show preview
@@ -1266,9 +1298,9 @@
           document.getElementById("photo-preview").classList.add("show");
           document.getElementById("photo-placeholder").style.display = "none";
           document.getElementById("photo-zone").classList.add("has-photo");
-          setPhotoStatus("✅ Đã chọn: " + file.name, "ok");
-        };
-        reader.readAsDataURL(file);
+          var kb = Math.round((_photoBase64.length * 0.75) / 1024);
+          setPhotoStatus("✅ Đã chọn: " + file.name + " (~" + kb + "KB)", "ok");
+        });
       }
 
       function removePhoto(e) {
@@ -1385,13 +1417,14 @@
           });
       }
 
-      // ─── Smart fetch: thử normal, fallback no-cors nếu CORS block ────
+      // ─── Smart fetch: JSON POST → no-cors GET fallback (mobile) ──────
       var _isLocal =
         location.protocol === "file:" ||
         location.hostname === "127.0.0.1" ||
         location.hostname === "localhost";
 
       function sendToGAS(payload) {
+        // Thử POST JSON bình thường (desktop / HTTPS host)
         return fetch(GAS_URL, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1402,6 +1435,7 @@
             return r.json();
           })
           .catch(function (err) {
+            // CORS bị block (mobile hoặc local) → fallback GET với URL params
             var isCorsErr =
               err.message &&
               (err.message.indexOf("CORS") !== -1 ||
@@ -1409,20 +1443,40 @@
                 err.message.indexOf("Failed") !== -1 ||
                 err.message.indexOf("NetworkError") !== -1);
             if (isCorsErr || _isLocal) {
-              // Fallback no-cors: GAS vẫn nhận và xử lý được, chỉ không đọc response
-              return fetch(GAS_URL, {
-                method: "POST",
-                mode: "no-cors",
-                headers: { "Content-Type": "text/plain" },
-                body: payload,
-              }).then(function () {
-                return { success: true, noCors: true };
-              });
+              try {
+                var data = JSON.parse(payload);
+                // base64 có thể rất lớn → encode an toàn
+                var params = new URLSearchParams({
+                  action: data.action || "",
+                  fileName: data.fileName || "",
+                  base64: data.base64 || "",
+                  mimeType: data.mimeType || "",
+                });
+                // GET request — không có preflight, mobile OK
+                return fetch(GAS_URL + "?" + params.toString(), {
+                  method: "GET",
+                })
+                  .then(function (r2) {
+                    return r2.json();
+                  })
+                  .catch(function () {
+                    // Nếu GET cũng fail (base64 quá dài) → no-cors POST cuối cùng
+                    return fetch(GAS_URL, {
+                      method: "POST",
+                      mode: "no-cors",
+                      headers: { "Content-Type": "text/plain" },
+                      body: payload,
+                    }).then(function () {
+                      return { success: true, noCors: true };
+                    });
+                  });
+              } catch (e2) {
+                return { success: false, error: e2.message };
+              }
             }
             throw err;
           });
       }
-
       function showProgress(pct) {
         var bar = document.getElementById("upload-progress");
         var fill = document.getElementById("upload-progress-fill");
